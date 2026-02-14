@@ -162,17 +162,57 @@ const jitiOptions = (cwd: string): JitiOptions => {
 	};
 };
 
-const isDefaultExport = (
-	object: Record<string, unknown>,
-): object is BetterAuthOptions => {
-	return (
-		typeof object === "object" &&
-		object !== null &&
-		!Array.isArray(object) &&
-		Object.keys(object).length > 0 &&
-		"options" in object
-	);
-};
+/**
+ * Normalize the config object returned by c12's loadConfig into BetterAuthOptions.
+ *
+ * c12's default resolver is `(mod) => mod.default || mod`, which means:
+ *
+ *   export const auth = betterAuth({...})
+ *     → config = { auth: { handler, api, options, ... } }
+ *     → config.auth.options is the BetterAuthOptions
+ *
+ *   export default betterAuth({...})       (or: const a = betterAuth({...}); export default a)
+ *     → config = { handler, api, options, ... }  (c12 unwraps .default)
+ *     → config.options is the BetterAuthOptions
+ *
+ *   export const auth = betterAuth({...}); export default auth;
+ *     → config = { handler, api, options, ... }  (c12 prefers .default, named export is lost)
+ *     → config.options is the BetterAuthOptions
+ *
+ * This function handles all three shapes in one place so both the explicit-path
+ * and auto-discovery code paths behave identically.
+ */
+function extractBetterAuthOptions(config: unknown): BetterAuthOptions | null {
+	if (typeof config !== "object" || config === null || Array.isArray(config)) {
+		return null;
+	}
+	const obj = config as Record<string, unknown>;
+
+	// Shape 1: named export  →  config.auth.options
+	if (
+		"auth" in obj &&
+		typeof obj.auth === "object" &&
+		obj.auth !== null &&
+		"options" in obj.auth
+	) {
+		return (obj.auth as Record<string, unknown>).options as BetterAuthOptions;
+	}
+
+	// Shape 2: default export (c12 unwrapped)  →  config.options
+	// The betterAuth() return value has handler, api, options, $context, $ERROR_CODES.
+	// We check options + handler + api to distinguish it from unrelated objects.
+	if (
+		"options" in obj &&
+		typeof obj.options === "object" &&
+		obj.options !== null &&
+		"handler" in obj &&
+		"api" in obj
+	) {
+		return obj.options as BetterAuthOptions;
+	}
+
+	return null;
+}
 export async function getConfig({
 	cwd,
 	configPath,
@@ -187,16 +227,7 @@ export async function getConfig({
 		if (configPath) {
 			let resolvedPath: string = path.join(cwd, configPath);
 			if (existsSync(configPath)) resolvedPath = configPath; // If the configPath is a file, use it as is, as it means the path wasn't relative.
-			const { config } = await loadConfig<
-				| {
-						auth: {
-							options: BetterAuthOptions;
-						};
-				  }
-				| {
-						options: BetterAuthOptions;
-				  }
-			>({
+			const { config } = await loadConfig({
 				configFile: resolvedPath,
 				dotenv: {
 					fileName: [".env", ".env.local"],
@@ -204,7 +235,8 @@ export async function getConfig({
 				jitiOptions: jitiOptions(cwd),
 				cwd,
 			});
-			if (!("auth" in config) && !isDefaultExport(config)) {
+			configFile = extractBetterAuthOptions(config);
+			if (!configFile) {
 				if (shouldThrowOnError) {
 					throw new Error(
 						`Couldn't read your auth config in ${resolvedPath}. Make sure to default export your auth instance or to export as a variable named auth.`,
@@ -215,20 +247,12 @@ export async function getConfig({
 				);
 				process.exit(1);
 			}
-			configFile = "auth" in config ? config.auth?.options : config.options;
 		}
 
 		if (!configFile) {
 			for (const possiblePath of possiblePaths) {
 				try {
-					const { config } = await loadConfig<{
-						auth: {
-							options: BetterAuthOptions;
-						};
-						default?: {
-							options: BetterAuthOptions;
-						};
-					}>({
+					const { config } = await loadConfig({
 						configFile: possiblePath,
 						dotenv: {
 							fileName: [".env", ".env.local"],
@@ -236,10 +260,12 @@ export async function getConfig({
 						jitiOptions: jitiOptions(cwd),
 						cwd,
 					});
-					const hasConfig = Object.keys(config).length > 0;
+					const hasConfig =
+						typeof config === "object" &&
+						config !== null &&
+						Object.keys(config).length > 0;
 					if (hasConfig) {
-						configFile =
-							config.auth?.options || config.default?.options || null;
+						configFile = extractBetterAuthOptions(config);
 						if (!configFile) {
 							if (shouldThrowOnError) {
 								throw new Error(
